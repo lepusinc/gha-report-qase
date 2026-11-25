@@ -1,0 +1,110 @@
+name: Report to Qase
+description: 'Sends test result files written by a Qase reporter in report mode (QASE_MODE=report) to Qase with qasectl: creates a test run, uploads the results and completes the run.'
+author: 'Lepus inc.'
+
+inputs:
+  results-path:
+    description: 'Directory that holds the result JSON files written by the reporter (e.g. "build/qase-report/results"). Download artifacts before calling this action if the files were written in another job.'
+    required: true
+  project:
+    description: 'Qase project code (e.g. "TFTC").'
+    required: true
+  api-token:
+    description: 'Qase API token. Pass it from a secret.'
+    required: true
+  title:
+    description: 'Title of the test run to create.'
+    required: true
+  description:
+    description: 'Description of the test run (e.g. the URL of the GitHub Actions run).'
+    required: false
+    default: ''
+  environment:
+    description: 'Slug of the Qase environment of the test run. Leave empty for no environment.'
+    required: false
+    default: ''
+  time-unit:
+    description: 'Unit of execution.start_time / end_time in the result files: "seconds" (the Qase PHP and JavaScript reporters) or "milliseconds". qasectl expects milliseconds, so "seconds" converts them before uploading.'
+    required: false
+    default: 'seconds'
+  qasectl-version:
+    description: 'Version (release tag) of qasectl to use.'
+    required: false
+    default: 'v0.7.0'
+
+outputs:
+  run-id:
+    description: 'ID of the created test run. Empty when no result files were found.'
+    value: ${{ steps.upload.outputs.run-id }}
+  run-url:
+    description: 'URL of the created test run in Qase. Empty when no result files were found.'
+    value: ${{ steps.upload.outputs.run-url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install qasectl
+      shell: bash
+      env:
+        QASECTL_VERSION: ${{ inputs.qasectl-version }}
+      run: |
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64)   asset=qasectl-linux-amd64 ;;
+          Linux-ARM64) asset=qasectl-linux-arm64 ;;
+          macOS-X64)   asset=qasectl-darwin-amd64 ;;
+          macOS-ARM64) asset=qasectl-darwin-arm64 ;;
+          *) echo "::error::Unsupported runner: ${RUNNER_OS}-${RUNNER_ARCH}"; exit 1 ;;
+        esac
+        curl -fsSL -o "$RUNNER_TEMP/qasectl" \
+          "https://github.com/qase-tms/qasectl/releases/download/${QASECTL_VERSION}/${asset}"
+        chmod +x "$RUNNER_TEMP/qasectl"
+
+    - name: Send results to Qase
+      id: upload
+      shell: bash
+      env:
+        RESULTS_PATH: ${{ inputs.results-path }}
+        QASE_PROJECT: ${{ inputs.project }}
+        QASE_API_TOKEN: ${{ inputs.api-token }}
+        RUN_TITLE: ${{ inputs.title }}
+        RUN_DESCRIPTION: ${{ inputs.description }}
+        RUN_ENVIRONMENT: ${{ inputs.environment }}
+        TIME_UNIT: ${{ inputs.time-unit }}
+        CONVERT_TIMES: ${{ github.action_path }}/scripts/convert-times.py
+      run: |
+        count=0
+        if [ -d "$RESULTS_PATH" ]; then
+          count=$(find "$RESULTS_PATH" -maxdepth 1 -name '*.json' -type f | wc -l | tr -d ' ')
+        fi
+        if [ "$count" -eq 0 ]; then
+          echo "::notice::No Qase result files in ${RESULTS_PATH}. No test run was created."
+          exit 0
+        fi
+
+        case "$TIME_UNIT" in
+          seconds)      python3 "$CONVERT_TIMES" "$RESULTS_PATH" > /dev/null ;;
+          milliseconds) ;;
+          *) echo "::error::time-unit must be \"seconds\" or \"milliseconds\": ${TIME_UNIT}"; exit 1 ;;
+        esac
+
+        create_args=(--project "$QASE_PROJECT" --token "$QASE_API_TOKEN" --title "$RUN_TITLE" --output "$RUNNER_TEMP/qase.env")
+        if [ -n "$RUN_DESCRIPTION" ]; then create_args+=(--description "$RUN_DESCRIPTION"); fi
+        if [ -n "$RUN_ENVIRONMENT" ]; then create_args+=(--environment "$RUN_ENVIRONMENT"); fi
+        "$RUNNER_TEMP/qasectl" testops run create "${create_args[@]}"
+        run_id=$(sed -n 's/^QASE_TESTOPS_RUN_ID=//p' "$RUNNER_TEMP/qase.env")
+        rm -f "$RUNNER_TEMP/qase.env"
+        run_url="https://app.qase.io/run/${QASE_PROJECT}/dashboard/${run_id}"
+        echo "run-id=${run_id}" >> "$GITHUB_OUTPUT"
+        echo "run-url=${run_url}" >> "$GITHUB_OUTPUT"
+
+        "$RUNNER_TEMP/qasectl" testops result upload \
+          --project "$QASE_PROJECT" --token "$QASE_API_TOKEN" --id "$run_id" \
+          --format qase --path "$RESULTS_PATH"
+
+        "$RUNNER_TEMP/qasectl" testops run complete \
+          --project "$QASE_PROJECT" --token "$QASE_API_TOKEN" --id "$run_id"
+
+        {
+          echo "### Qase"
+          echo "Sent ${count} results to [${RUN_TITLE}](${run_url})."
+        } >> "$GITHUB_STEP_SUMMARY"

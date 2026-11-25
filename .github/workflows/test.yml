@@ -1,0 +1,36 @@
+name: Test action
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests (convert-times.py)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: python3 -m unittest discover -s tests -v
+
+  no-results:
+    name: No result files (no run is created)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: mkdir -p "$RUNNER_TEMP/empty"
+      - id: qase
+        uses: ./
+        with:
+          results-path: ${{ runner.temp }}/empty
+          project: TEST
+          api-token: dummy
+          title: 'Never created'
+      - name: Assert no run was created
+        env:
+          RUN_ID: ${{ steps.qase.outputs.run-id }}
+        run: test -z "$RUN_ID"
